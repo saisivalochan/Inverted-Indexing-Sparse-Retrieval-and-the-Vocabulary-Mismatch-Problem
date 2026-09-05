@@ -1,0 +1,122 @@
+{
+  "scifact": {
+    "total_terms": 838128,
+    "documents": 5183,
+    "non_empty_documents": 5183,
+    "unique_terms": 28865,
+    "demo": {
+      "docid": "31715818",
+      "doc_length": 64,
+      "distinct_terms": 46,
+      "top_tf": [
+        [
+          "cell",
+          5
+        ],
+        [
+          "stem",
+          5
+        ],
+        [
+          "nanotechnolog",
+          3
+        ],
+        [
+          "track",
+          3
+        ],
+        [
+          "us",
+          3
+        ]
+      ],
+      "df": {
+        "cell": 2530,
+        "stem": 454,
+        "nanotechnolog": 4,
+        "track": 48,
+        "us": 2238
+      }
+    }
+  },
+  "fever": {
+    "total_terms": 325179165,
+    "documents": 5416568,
+    "non_empty_documents": 5416568,
+    "unique_terms": 3293639,
+    "demo": {
+      "docid": "Ukrainian_Soviet_Socialist_Republic",
+      "doc_length": 210,
+      "distinct_terms": 137,
+      "top_tf": [
+        [
+          "soviet",
+          12
+        ],
+        [
+          "republ",
+          8
+        ],
+        [
+          "ukrainian",
+          7
+        ],
+        [
+          "ukrain",
+          7
+        ],
+        [
+          "union",
+          6
+        ]
+      ],
+      "df": {
+        "soviet": 40403,
+        "republ": 88471,
+        "ukrainian": 15079,
+        "ukrain": 17073,
+        "union": 112949
+      }
+    }
+  },
+  "hotpotqa": {
+    "total_terms": 172477066,
+    "documents": 5233329,
+    "non_empty_documents": 5233328,
+    "unique_terms": 2644892,
+    "demo": {
+      "docid": "2816539",
+      "doc_length": 39,
+      "distinct_terms": 36,
+      "top_tf": [
+        [
+          "scott",
+          2
+        ],
+        [
+          "derrickson",
+          2
+        ],
+        [
+          "he",
+          2
+        ],
+        [
+          "instal",
+          1
+        ],
+        [
+          "lo",
+          1
+        ]
+      ],
+      "df": {
+        "scott": 15764,
+        "derrickson": 10,
+        "he": 673663,
+        "instal": 14083,
+        "lo": 37275
+      }
+    }
+  }
+}

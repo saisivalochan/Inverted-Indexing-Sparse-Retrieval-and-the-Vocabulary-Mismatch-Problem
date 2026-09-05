@@ -1,0 +1,118 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{booktabs,multirow,longtable,graphicx,amsmath,hyperref,enumitem,xcolor}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\hypersetup{colorlinks=true,linkcolor=blue!60!black,urlcolor=blue!60!black}
+\setlength{\parskip}{4pt}\setlength{\parindent}{0pt}
+\newcommand{\tbl}[1]{\IfFileExists{tables/#1.tex}{\input{tables/#1.tex}}{\emph{(table #1 appears after the run)}}}
+
+\title{Inverted Indexing, Sparse Retrieval, and the Vocabulary Mismatch Problem}
+\author{ROLL1 \and ROLL2}
+\date{5 September 2026}
+
+\begin{document}
+\maketitle
+
+\section*{Datasets}
+BEIR test splits loaded with \texttt{ir\_datasets} (\texttt{beir/<name>/test}). All runs on one laptop under WSL2
+(Intel Core Ultra 7 155U, 7.6\,GB RAM for WSL, no GPU; Pyserini 2.3.0, Lucene 10, Java 21, PyTorch CPU).
+\begin{itemize}[nosep]
+  \item \textbf{SciFact}: 5\,183 documents, 300 test queries, 339 qrels. Standard split, no deviation.
+  \item \textbf{FEVER}: 5\,416\,568 documents, 6\,666 test queries, 7\,937 qrels. Parts~1--3 on all queries; Parts~4--5 on a fixed random sample of 500 test queries (seed 0), because feedback and LLM/SPLADE encoding run per query on CPU.
+  \item \textbf{HotpotQA}: 5\,233\,329 documents, 7\,405 test queries, 14\,810 qrels (two gold passages per question). Same 500-query sample for Parts~4--5.
+\end{itemize}
+Metrics: nDCG@10, Recall@100, MRR@10, MAP with \texttt{ir\_measures} on top-100 runs. Every table states the number of queries used, and each baseline is recomputed on the same queries as the method it is compared with.
+
+\section{Part 1: Index}
+One Lucene index per corpus with \texttt{python -m pyserini.index.lucene -collection JsonCollection -storeDocvectors}
+(\texttt{contents} = title + text; default English analyzer; document vectors stored for Part~4). Build time is the wall-clock
+time of the indexing process alone (corpus dump excluded), measured with no other job running.
+\texttt{LuceneIndexReader} gives the statistics Part~4a needs: term-frequency vector (\texttt{get\_document\_vector}),
+document length (its sum) and corpus document frequency (\texttt{get\_term\_counts}); Table~\ref{tab:p1demo} shows them for one gold document.
+
+\tbl{part1}
+\tbl{part1_demo}
+
+\section{Part 2: Sparse retrieval baselines}
+\texttt{LuceneSearcher} over each Part~1 index: (a) Pyserini default BM25 ($k_1{=}0.9$, $b{=}0.4$); (b) BM25 with $k_1, b$ chosen
+per dataset by an exhaustive $5\times5$ grid over all test queries, selecting by nDCG@10 (Table~\ref{tab:grid}); (c) classic
+TF-IDF by setting Lucene's \texttt{ClassicSimilarity} on the underlying \texttt{IndexSearcher}.
+
+\tbl{part2}
+\tbl{part2_grid}
+
+PART2DISCUSSION
+
+\section{Part 3: Vocabulary mismatch}
+For every (query, gold document) pair, BM25 (tuned) \emph{fails} if the gold document is not in the top-10.
+Lexical overlap = Jaccard coefficient between the analysed query tokens and the gold document's indexed term vector
+(same analyzer as the index). Failures are bucketed as: \emph{no lexical overlap} (no shared analysed term);
+\emph{abbreviation vs.\ expansion} (an all-caps token on one side whose initials appear as consecutive words on the other);
+\emph{partial overlap / paraphrase} (fewer than half of the query terms in the gold document); \emph{high overlap but outranked}
+(at least half of the query terms present, yet other documents score higher).
+
+\tbl{part3_cats}
+\tbl{part3_examples}
+\tbl{part3_stats}
+\tbl{part3_bins}
+\tbl{part3_fig}
+
+\paragraph{Verdict.} PART3VERDICT
+
+\section{Part 4: Pseudo-relevance feedback}
+\subsection{4a. Rocchio and RM3 (corpus-retrieved feedback)}
+Own implementation (\texttt{rocchio.py}):
+\[ w_t = \alpha\, f(q)[t] + \frac{\beta}{N}\sum_{d\in\text{top-}N} \tilde f(d)[t], \qquad \alpha=1,\ \beta=0.75, \]
+with $f(q)$ and $\tilde f(d)$ length-normalised term frequencies ($\mathrm{tf}/|d|$). Feedback vectors are the Part~1 term vectors
+of the top-$N$ tuned-BM25 documents (\texttt{IndexReader.get\_document\_vector}); terms in more than 10\% of the documents
+(\texttt{get\_term\_counts}) are never added; the $k$ heaviest remaining centroid terms are kept. The re-weighted query is built
+with Pyserini's query builder as a Boolean OR of \texttt{BoostQuery(TermQuery(contents:t), w\_t)} and re-searched.
+RM3: \texttt{set\_rm3(fb\_terms=k, fb\_docs=N, original\_query\_weight=0.5)}.
+
+\tbl{part4a}
+
+\paragraph{Query drift.} Queries with the largest nDCG@10 drop after Rocchio, with the added terms:
+\tbl{part4a_drift}
+PART4ADRIFT
+
+\subsection{4b. HyDE (LLM-generated feedback)}
+Hypothetical documents are sampled locally on CPU with Qwen2.5-0.5B-Instruct (Transformers; $T{=}0.7$, top-$p$ 0.9;
+two 96-token documents per query for SciFact, one 64-token document per query for the FEVER/HotpotQA samples), prompted to
+write a passage that supports/refutes the claim or answers the question. The unchanged \texttt{rocchio.py} then receives the
+analysed hypothetical documents as its feedback vectors. Variants on the same queries as 4a: naive concatenation
+(query + hypothetical documents as one BM25 query), HyDE + Rocchio ($k\in\{10,20\}$), and 4a's corpus PRF.
+
+\tbl{part4b}
+\tbl{part4b_examples}
+
+\paragraph{Feedback source vs.\ combination method.} PART4BVERDICT
+
+\section{Part 5: SPLADE}
+Checkpoint \texttt{naver/splade-cocondenser-ensembledistil} (SPLADE++ EnsembleDistil), $w_j=\max_i\log(1+\mathrm{ReLU}(o_{ij}))$.
+SciFact is encoded on CPU with Pyserini's \texttt{SpladeDocumentEncoder} (max length 256, integer-quantised weights) and indexed
+with \texttt{-impact -pretokenized}; the prebuilt SciFact index is run as a sanity check. Encoding 5M documents on CPU is not
+feasible, so FEVER and HotpotQA use Pyserini's prebuilt \texttt{beir-v1.0.0-*.splade-pp-ed} impact indexes (same checkpoint);
+queries are encoded locally with \texttt{SpladeQueryEncoder} and searched with \texttt{LuceneImpactSearcher}.
+
+\tbl{part5}
+\tbl{part5_index}
+
+PART5DISCUSSION
+
+\subsection*{Expansion terms: SPLADE vs.\ Rocchio vs.\ HyDE}
+For 12 sample queries per dataset: the top-10 vocabulary terms SPLADE weights beyond the literal query word-pieces, next to
+the top-10 Rocchio terms (4a, $N{=}10,k{=}20$) and the top-10 HyDE+Rocchio terms (4b, $k{=}20$). Overlap is counted after
+stemming all three lists with the index analyzer.
+
+\tbl{part5_overlap}
+PART5OVERLAP
+\tbl{part5_terms}
+
+\section*{Use of LLM assistants}
+Claude Code (Anthropic, Claude Fable 5.1) was used as a coding assistant inside VS Code/WSL: it wrote the scripts from our
+instructions and the problem statement after inspecting the Pyserini API, ran them in our WSL environment, generated the LaTeX
+tables from the result files and drafted this report, which we checked against the numbers and edited. The local LLM used
+inside the experiments (Part~4b) is Qwen2.5-0.5B-Instruct, run offline. Shareable chat links: CHATLINKS.
+
+\end{document}

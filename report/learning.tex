@@ -1,0 +1,294 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{booktabs,multirow,longtable,graphicx,amsmath,hyperref,enumitem,listings,xcolor}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\hypersetup{colorlinks=true,linkcolor=blue!60!black,urlcolor=blue!60!black}
+\setlength{\parskip}{4pt}\setlength{\parindent}{0pt}
+\lstset{language=Python,basicstyle=\ttfamily\small,keywordstyle=\color{blue!70!black},commentstyle=\color{gray},
+        stringstyle=\color{green!40!black},breaklines=true,frame=single,columns=fullflexible,showstringspaces=false}
+\newcommand{\tbl}[1]{\IfFileExists{tables/#1.tex}{\input{tables/#1.tex}}{\emph{(table #1 appears after the run)}}}
+
+\title{Study notes: Inverted Indexing, Sparse Retrieval and Vocabulary Mismatch\\
+\large Everything behind the five parts of the assignment and every script in \texttt{cs6101/}}
+\date{September 2026}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{The whole pipeline in one picture}
+Every part of the assignment is one stage of the same pipeline:
+\begin{enumerate}[nosep]
+  \item \textbf{Data}: BEIR corpora (documents), test queries, and \emph{qrels} (which documents are relevant to which query).
+  \item \textbf{Index} (Part~1): turn the documents into a Lucene inverted index so a query can be answered in milliseconds.
+  \item \textbf{Retrieve} (Part~2): score documents against a query with BM25 or TF-IDF and evaluate the ranking with nDCG, Recall, MRR, MAP.
+  \item \textbf{Diagnose} (Part~3): look at the queries BM25 gets wrong and measure how much they share words with their gold document.
+  \item \textbf{Expand the query} (Part~4): add words to the query, taken either from the top retrieved documents (Rocchio, RM3) or from text an LLM writes (HyDE).
+  \item \textbf{Learn the expansion} (Part~5): SPLADE, a neural model that produces the sparse word-weight vector itself.
+\end{enumerate}
+All scripts live in one folder, share \texttt{common.py} and \texttt{datasets.py}, write JSON to \texttt{results/}, and
+\texttt{make\_tables.py} turns the JSON into the LaTeX tables used by both reports. \texttt{run\_all.sh} runs the scripts in order,
+one at a time (the laptop has 7.6\,GB of RAM for WSL and no GPU; two heavy jobs at once thrash or get killed by the OOM killer).
+
+\section{Setup and how to run}
+\begin{itemize}[nosep]
+  \item WSL2 Ubuntu, Python 3.12, Java 21, \texttt{pyserini==2.3.0} (bundles Anserini and Lucene~10), \texttt{ir\_datasets}, \texttt{ir\_measures}, PyTorch (CPU), Transformers, matplotlib, scipy.
+  \item \texttt{python download.py} once: fetches the SPLADE checkpoint, the Qwen model, and the three prebuilt SPLADE indexes.
+  \item \texttt{bash run\_all.sh}: \texttt{index.py} $\to$ \texttt{index\_stats.py} $\to$ \texttt{phase2.py} $\to$ \texttt{phase3.py} $\to$ \texttt{phase4a.py} $\to$ \texttt{hyde\_generate.py} $\to$ \texttt{phase4b.py} $\to$ \texttt{phase5.py} $\to$ \texttt{make\_tables.py}. Log in \texttt{logs/run\_all.log}.
+  \item Any script also takes dataset names: \texttt{python phase2.py scifact}.
+  \item Compile: \texttt{pdflatex report.tex} (twice, for references) inside \texttt{report/}; same for \texttt{learning.tex}.
+\end{itemize}
+Two pitfalls met on this machine: a NUL byte written into the 1.7\,GB HotpotQA JSONL on the OneDrive mount made Anserini stop
+silently at 2.9M of 5.2M documents (fix: delete and regenerate the file; check \texttt{Total N documents indexed} in the log),
+and running the LLM, the SPLADE encoder and an index build together made the index build four times slower and triggered the
+OOM killer. Timings in the report were therefore measured with one job at a time.
+
+\section{Shared code: \texttt{datasets.py} and \texttt{common.py}}
+\texttt{datasets.py} maps short names to \texttt{ir\_datasets} ids (\texttt{beir/scifact/test}, \ldots) and exposes
+\texttt{docs\_iter()}, \texttt{queries\_iter()}, \texttt{qrels\_iter()}. A document has \texttt{doc\_id, title, text};
+a query has \texttt{query\_id, text}; a qrel has \texttt{query\_id, doc\_id, relevance}.
+
+\texttt{common.py}:
+\begin{lstlisting}
+METRICS = [nDCG @ 10, R @ 100, RR @ 10, AP]      # ir_measures objects
+SAMPLE = 500                                       # queries for Parts 4-5 on FEVER / HotpotQA
+
+def load(name, sample=None):        # queries + qrels, optionally a fixed random sample
+    ...
+    random.Random(0).shuffle(queries)               # seed 0 => same sample in every script
+    queries = sorted(queries[:sample], key=lambda q: q.query_id)
+def evaluate(run, qrels):           # run = {qid: {docid: score}}
+    return {str(m): round(float(v), 4) for m, v in calc_aggregate(METRICS, qrels, run).items()}
+def search(searcher, queries, k=100):
+    return hits_to_run(searcher.batch_search([q.text ...], [q.query_id ...], k=k, threads=8))
+\end{lstlisting}
+Why a sample? Parts~4 and~5 do work \emph{per query} (a second search with a long weighted query, LLM generation, SPLADE
+encoding). On 5M-document corpora that is minutes per hundred queries on a CPU, so a fixed 500-query subset keeps the
+experiments feasible; the BM25 baseline is always recomputed on the same subset so comparisons stay fair.
+\texttt{save(part, name, data)} merges one dataset's result into \texttt{results/<part>.json}.
+
+\section{Part 1: building the index (\texttt{index.py}, \texttt{index\_stats.py})}
+\subsection{Concept}
+An \emph{inverted index} maps every term to a \emph{postings list}: the documents containing it and the term frequency (tf) in
+each. Lucene also stores per document the length (for normalisation) and, only if asked (\texttt{-storeDocvectors}), the full
+term vector of each document, which is what Rocchio needs later. Before indexing, text goes through an \emph{analyzer}:
+tokenise, lowercase, remove stop words, Porter-stem (\emph{studies}, \emph{studying} $\to$ \emph{studi}). Queries go
+through the same analyzer, otherwise nothing would match.
+
+\subsection{Code}
+\begin{lstlisting}
+for doc in datasets.get_corpus(datasets.load_dataset(name)):
+    f.write(json.dumps({"id": doc.doc_id, "contents": doc.title + "\n" + doc.text}) + "\n")
+subprocess.run(["python", "-m", "pyserini.index.lucene", "-collection", "JsonCollection",
+                "-input", collection_dir, "-index", index_dir, "-storeDocvectors"], check=True)
+\end{lstlisting}
+Pyserini's \texttt{JsonCollection} wants one JSON object per line with \texttt{id} and \texttt{contents}. The indexer is a
+Java program, so it is launched as a subprocess and timed around the call; the directory size afterwards is the index size.
+\texttt{index\_stats.py} then opens the index with \texttt{LuceneIndexReader}:
+\begin{lstlisting}
+reader.stats()                          # documents, unique_terms, total_terms
+reader.get_document_vector(docid)       # {"cell": 5, "stem": 5, ...}  analysed terms -> tf
+sum(vec.values())                       # document length in indexed tokens
+reader.get_term_counts("cell", analyzer=None)[0]   # df: documents containing the term
+\end{lstlisting}
+\texttt{analyzer=None} matters: the term from a document vector is already stemmed; running the analyzer again could stem it a
+second time and look up the wrong string.
+\tbl{part1}\tbl{part1_demo}
+
+\section{Part 2: BM25, tuning, TF-IDF (\texttt{phase2.py})}
+\subsection{Concept}
+BM25 scores a document $d$ for query $q$ as
+\[ \sum_{t\in q} \mathrm{idf}(t)\,\frac{\mathrm{tf}(t,d)\,(k_1+1)}{\mathrm{tf}(t,d)+k_1\bigl(1-b+b\,|d|/\mathrm{avgdl}\bigr)} ,\qquad
+   \mathrm{idf}(t)=\log\frac{N-\mathrm{df}(t)+0.5}{\mathrm{df}(t)+0.5}. \]
+$k_1$ controls how quickly repeated occurrences stop adding score (saturation); $b\in[0,1]$ controls how strongly long documents
+are penalised ($b{=}0$: no length normalisation, $b{=}1$: full). Pyserini's default is $k_1{=}0.9$, $b{=}0.4$.
+Classic TF-IDF (Lucene's \texttt{ClassicSimilarity}) uses $\sqrt{\mathrm{tf}}\cdot\mathrm{idf}^2$ with a cosine-style length norm:
+no saturation and a weaker, fixed length normalisation, which is why it is usually worse than BM25.
+
+Metrics on a ranked list with relevance labels: \textbf{nDCG@10} = DCG of the top-10 ($\sum \mathrm{rel}_i/\log_2(i+1)$)
+divided by the DCG of the ideal ordering; \textbf{Recall@100} = fraction of relevant documents found in the top-100;
+\textbf{MRR@10} = $1/\mathrm{rank}$ of the first relevant document if it is within 10, else 0; \textbf{MAP} = mean over queries
+of the average of precision at each relevant document's rank. All averaged over queries by \texttt{ir\_measures}.
+
+\subsection{Code}
+\begin{lstlisting}
+searcher = LuceneSearcher(f"indexes/{name}")
+searcher.set_bm25(0.9, 0.4)
+for k1 in [0.6, 0.9, 1.2, 1.5, 2.0]:
+    for b in [0.3, 0.4, 0.5, 0.75, 1.0]:
+        searcher.set_bm25(k1, b)
+        grid[(k1, b)] = common.evaluate(common.search(searcher, queries), qrels)
+k1, b = max(grid, key=lambda p: grid[p]["nDCG@10"])
+searcher.object.searcher.setSimilarity(ClassicSimilarity())     # Lucene IndexSearcher via pyjnius
+\end{lstlisting}
+The similarity is a property of the searcher, not of the index, so TF-IDF needs no re-indexing.
+\tbl{part2}\tbl{part2_grid}
+
+\section{Part 3: seeing vocabulary mismatch (\texttt{phase3.py})}
+\subsection{Concept}
+\emph{Vocabulary mismatch}: the query and the relevant document say the same thing with different words (synonyms:
+\emph{tumour}/\emph{neoplasm}; paraphrase: \emph{reduces the risk of}/\emph{is protective against}; abbreviation:
+\emph{MRI}/\emph{magnetic resonance imaging}). A lexical model such as BM25 can only match identical (stemmed) strings.
+To measure it we use the \emph{Jaccard coefficient} $J=|Q\cap D|/|Q\cup D|$ between the set of analysed query tokens and
+the set of terms in the gold document's indexed vector. Because both sides are analysed the same way, $J$ measures exactly
+what BM25 could match.
+
+How strongly does low $J$ predict a miss? We compare the $J$ distribution of pairs where the gold document is in the top-10
+(success) with pairs where it is not (failure), and report the \emph{AUC}: the probability that a random success pair has a
+higher $J$ than a random failure pair (0.5 = no signal, 1.0 = perfect). It equals the Mann--Whitney $U$ statistic divided by
+$n_{\text{succ}}\,n_{\text{fail}}$, which is what \texttt{scipy.stats.mannwhitneyu} gives.
+
+\subsection{Code}
+\begin{lstlisting}
+ranked = sorted(run[q.query_id], key=run[q.query_id].get, reverse=True)
+rank = ranked.index(docid) + 1 if docid in ranked else None
+success = rank is not None and rank <= 10
+jaccard = len(q_tok & d_tok) / len(q_tok | d_tok)
+auc = mannwhitneyu(succ, fail).statistic / (len(succ) * len(fail))
+\end{lstlisting}
+Failure categories are a simple heuristic: no shared term $\to$ \emph{no lexical overlap}; an all-caps token on one side
+(regex \verb|\b[A-Z][A-Z0-9\-]{1,7}s?\b|) whose letters appear as the initials of consecutive words on the other side $\to$
+\emph{abbreviation vs.\ expansion}; less than half of the query terms present $\to$ \emph{partial overlap}; otherwise
+\emph{high overlap but outranked} (the words are there, other documents just score higher: length, competing near-duplicates,
+or a multi-hop question whose second gold passage shares few words). The document text for the examples comes from
+\texttt{ir\_datasets}' \texttt{docs\_store().get(docid)}, because the index does not store raw text.
+\tbl{part3_stats}\tbl{part3_bins}\tbl{part3_cats}
+
+\section{Part 4a: Rocchio and RM3 (\texttt{rocchio.py}, \texttt{phase4a.py})}
+\subsection{Concept}
+Pseudo-relevance feedback assumes the top-$N$ documents of a first search are relevant and uses their vocabulary to
+re-write the query. Rocchio:
+\[ w_t = \alpha\, f(q)[t] + \frac{\beta}{N}\sum_{d\in\text{top-}N}\tilde f(d)[t]. \]
+$f(q)$ is the query's term-frequency vector, $\tilde f(d)$ the document's; we divide both by their length so that a long
+document does not dominate and the query side keeps total weight $\alpha$. Terms present in more than 10\% of the corpus are
+never added (they carry no information and would pull every query the same way); the $k$ heaviest remaining terms are kept.
+\emph{Query drift}: when the top-$N$ contain off-topic documents, their words are added and the re-search moves away from the
+original intent.
+
+RM3 is the probabilistic cousin: it estimates a relevance language model from the feedback documents, keeps the top terms,
+and interpolates it with the original query ($\lambda$ = \texttt{original\_query\_weight}). Pyserini implements it in Java
+behind \texttt{set\_rm3}.
+
+\subsection{Code}
+\begin{lstlisting}
+centroid = Counter()
+for vec in vectors:                      # vectors: term -> tf, one per feedback document
+    length = sum(vec.values()) or 1
+    for t, tf in vec.items():
+        centroid[t] += tf / length
+weights = {t: alpha * tf / q_len + beta / n * centroid.get(t, 0.0) for t, tf in q.items()}
+expansion = sorted((t for t in centroid if t not in q and not self.too_common(t)), key=lambda t: -centroid[t])[:k]
+for t in expansion:
+    weights[t] = beta / n * centroid[t]
+
+builder = querybuilder.get_boolean_query_builder()
+for term, w in weights.items():
+    builder.add(querybuilder.get_boost_query(JTermQuery(JTerm("contents", term)), float(w)), JBooleanClauseOccur.should.value)
+hits = searcher.search(builder.build(), k=100)
+\end{lstlisting}
+Why the query builder instead of pasting words into a string? A string query would be analysed again (double stemming) and
+could not carry per-term weights; \texttt{BoostQuery} multiplies each term's BM25 contribution by $w_t$.
+In \texttt{phase4a.py} the feedback vectors come from the index (\texttt{rocchio.index\_vectors(top-N docids)}), the run is
+evaluated, per-query nDCG@10 is compared with the baseline to list drift candidates, and RM3 is run on the same queries:
+\begin{lstlisting}
+searcher.set_rm3(fb_terms=k, fb_docs=n_fb, original_query_weight=0.5)
+entry["rm3"] = common.evaluate(common.search(searcher, queries), qrels)
+searcher.unset_rm3()
+\end{lstlisting}
+\tbl{part4a}
+
+\section{Part 4b: HyDE (\texttt{hyde\_generate.py}, \texttt{phase4b.py})}
+\subsection{Concept}
+HyDE (Hypothetical Document Embeddings) asks an LLM to write the document that \emph{would} answer the query, then uses that
+text for retrieval. Here it replaces the corpus-retrieved feedback documents of 4a: the LLM's passage is analysed into a
+term vector and fed to the same Rocchio code. Two ways to combine: \emph{naive concatenation} (query + passage as one bag of
+words, so every generated word counts like a query word) versus the \emph{feedback model} (Rocchio keeps the query dominant,
+filters common words and keeps only $k$ terms). The question the assignment asks is which matters more: where the words come
+from (LLM vs.\ corpus) or how they are combined (concatenation vs.\ Rocchio).
+
+\subsection{Code}
+\begin{lstlisting}
+tok = AutoTokenizer.from_pretrained(MODEL, padding_side="left")      # left padding for batched generation
+model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32).eval()
+prompts = [tok.apply_chat_template([{"role": "user", "content": PROMPT[name].format(q=q.text)}],
+                                   tokenize=False, add_generation_prompt=True) for q in batch]
+gen = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=True, temperature=0.7, top_p=0.9,
+                     num_return_sequences=n_docs, pad_token_id=tok.pad_token_id)
+texts = tok.batch_decode(gen[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)   # drop the prompt tokens
+\end{lstlisting}
+The script appends one JSON line per query and skips ids already present, so it can be stopped and resumed. The model is
+Qwen2.5-0.5B-Instruct because it is the largest that runs at a usable speed on this CPU (no GPU, so no vLLM).
+In \texttt{phase4b.py}, \texttt{rocchio.text\_vectors(hyde[qid])} calls \texttt{Analyzer.compute\_document\_vector} on the
+generated passages; everything after that is the unchanged 4a code.
+\tbl{part4b}
+
+\section{Part 5: SPLADE (\texttt{phase5.py})}
+\subsection{Concept}
+SPLADE puts a BERT encoder with its masked-language-model head over the text; for every input position $i$ the head produces
+a logit $o_{ij}$ for every vocabulary word $j$. The representation is
+\[ w_j = \max_i \log\bigl(1+\mathrm{ReLU}(o_{ij})\bigr), \]
+one weight per vocabulary word, zero for most of them (the FLOPS regulariser during training pushes weights to zero). A word
+gets weight even if it never appears in the text, because the MLM head predicts related words: that is learned expansion.
+Documents are encoded once and stored in an \emph{impact index}: a Lucene index whose ``term frequency'' is the integer
+weight (Pyserini quantises $w_j$ to integers), built with \texttt{-impact -pretokenized}. At query time the query is encoded
+the same way and the score is the dot product, computed by the usual posting-list traversal. So SPLADE is neural on both
+sides but still a sparse inverted index at retrieval time.
+
+\subsection{Code}
+\begin{lstlisting}
+doc_encoder = SpladeDocumentEncoder(MODEL, device="cpu")
+vectors = doc_encoder.encode([d["contents"] for d in batch], max_length=256)   # list of {word: int weight}
+f.write(json.dumps({"id": d["id"], "contents": "", "vector": {t: w for t, w in v.items() if w > 0}}) + "\n")
+subprocess.run(["python", "-m", "pyserini.index.lucene", "-collection", "JsonVectorCollection",
+                "-input", coll, "-index", index, "-impact", "-pretokenized"], check=True)
+searcher = LuceneImpactSearcher(index, SpladeQueryEncoder(MODEL, device="cpu"))
+hits = searcher.batch_search(texts, qids, k=100, threads=8)
+\end{lstlisting}
+SciFact (5\,183 documents) is encoded locally; FEVER and HotpotQA would take days on a CPU, so their prebuilt
+\texttt{beir-v1.0.0-*.splade-pp-ed} indexes (same checkpoint) are downloaded and only the queries are encoded here.
+The expansion-term comparison lists SPLADE's non-zero words that are not literal word-pieces of the query
+(\texttt{encoder.tokenizer.tokenize(text)}), next to Rocchio's and HyDE's terms for the same query; all three are passed
+through the index analyzer (stemming) before counting overlaps, since SPLADE works on unstemmed word-pieces.
+\tbl{part5}\tbl{part5_overlap}
+
+\section{Reading the results}
+\begin{itemize}[nosep]
+  \item \texttt{results/part1.json}: build time, size; \texttt{part1\_stats.json}: IndexReader statistics.
+  \item \texttt{part2.json}: default/tuned/TF-IDF metrics, the full grid, the chosen $k_1,b$, BM25 latency.
+  \item \texttt{part3.json}: failure rate, Jaccard mean/median for success vs.\ failure, AUC, failure rate per Jaccard bin, category counts, examples; \texttt{part3\_jaccard\_*.pdf}: histograms.
+  \item \texttt{part4a.json}: BM25 vs.\ Rocchio vs.\ RM3 per $(N,k)$, drift candidates, expansion terms of the first 12 queries.
+  \item \texttt{hyde\_*.jsonl}: generated passages; \texttt{part4b.json}: concatenation vs.\ HyDE+Rocchio vs.\ corpus PRF.
+  \item \texttt{part5.json}: SPLADE metrics, own-index encode/index time and size, per-query expansion rows and average overlaps.
+\end{itemize}
+What to expect and why: BM25 tuning moves nDCG@10 by a point or two at most; TF-IDF is clearly below BM25. Most BM25 failures
+have low Jaccard, and pairs with $J{=}0$ almost always fail, but many failures still share words (they are \emph{outranked},
+not unmatched), so overlap predicts failure strongly but not perfectly. Corpus PRF helps recall more than precision and can
+hurt SciFact, whose claims are short and specific (drift). HyDE with Rocchio weighting tends to beat naive concatenation:
+the combination method matters at least as much as the source. SPLADE, trained on MS~MARCO, is the strongest system on all
+three datasets because its expansion is learned rather than guessed from a few documents.
+
+\section{Deliverable checklist}
+\begin{tabular}{p{0.55\textwidth}p{0.4\textwidth}}\toprule
+Problem statement asks for & Where it is \\ \midrule
+Corpus size, queries, deviations & report, Datasets paragraph \\
+Index build time and size & Table part1 (\texttt{index.py}) \\
+Default / tuned BM25 / TF-IDF table, $k_1,b$ and justification & Tables part2, part2\_grid, Part~2 text \\
+Failure categories with examples, Jaccard comparison, verdict & Tables part3\_*, figure, Part~3 verdict \\
+Rocchio and RM3 at $\geq 2$ $(N,k)$, drift examples & Table part4a, drift list \\
+Concatenation / HyDE-Rocchio / corpus PRF, verdict & Table part4b, Part~4b verdict \\
+SPLADE metrics, 10+ query three-way term table, overlap, disagreements & Tables part5, part5\_overlap, part5\_terms \\
+LLM usage and chat links & last section of the report \\ \bottomrule
+\end{tabular}
+
+\section{Questions to test yourself}
+\begin{enumerate}[nosep]
+  \item Which call would fail if the index were built without \texttt{-storeDocvectors}?
+  \item Why is Jaccard computed on analysed tokens rather than raw words?
+  \item What happens to the Rocchio weights if you remove the division by document length?
+  \item Why can the same Rocchio class be used for 4a and 4b without any change?
+  \item Why does SPLADE need \texttt{-pretokenized}, and what would the analyzer do to its word-pieces otherwise?
+  \item Given one query, compute its BM25 score for a two-term document by hand with $k_1{=}0.9$, $b{=}0.4$.
+  \item Change the failure threshold to top-20: which numbers in Part~3 move, and in which direction?
+\end{enumerate}
+\end{document}

@@ -1,0 +1,8 @@
+\begin{table}[ht]\centering\small
+\begin{tabular}{lrrrrr}\toprule
+Dataset & Documents & Test queries & Unique terms & Build time & Index size \\ \midrule
+SciFact & 5,183 & 300 & 28,865 & 0.1 min & 4.7 MB \\
+FEVER & 5,416,568 & 6666 & 3,293,639 & 18.5 min & 2.30 GB \\
+HotpotQA & 5,233,329 & -- & 2,644,892 & 11.9 min & 1.22 GB \\
+\bottomrule\end{tabular}
+\caption{Part 1: Lucene index per dataset (Pyserini \texttt{JsonCollection}, \texttt{-storeDocvectors}, 4 indexing threads).}\label{tab:part1}\end{table}

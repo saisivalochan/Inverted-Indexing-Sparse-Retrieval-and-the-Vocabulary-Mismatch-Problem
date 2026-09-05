@@ -1,0 +1,10 @@
+collection/
+indexes/
+indexes_splade/
+collection_splade/
+logs/
+__pycache__/
+report/*.aux
+report/*.log
+report/*.out
+report/*.toc

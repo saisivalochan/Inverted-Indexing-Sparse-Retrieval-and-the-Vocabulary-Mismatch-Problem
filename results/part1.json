@@ -1,0 +1,14 @@
+{
+  "scifact": {
+    "build_time_s": 9,
+    "index_size_bytes": 4661252
+  },
+  "fever": {
+    "build_time_s": 1111,
+    "index_size_bytes": 2296936151
+  },
+  "hotpotqa": {
+    "build_time_s": 716,
+    "index_size_bytes": 1218727574
+  }
+}
